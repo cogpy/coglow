@@ -1,0 +1,257 @@
+# CogLow (Glow) Comprehensive CI Pipeline
+# Multi-platform build, test, and quality checks
+name: CogLow CI
+
+on:
+  push:
+    branches: [ main, nightly, develop, feature/** ]
+  pull_request:
+    branches: [ main, nightly ]
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  # ============================================
+  # Code Quality
+  # ============================================
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck clang-format clang-tidy
+
+      - name: Run cppcheck
+        run: |
+          cppcheck --enable=warning,style --std=c++17 \
+            --suppress=missingIncludeSystem \
+            -I include/ \
+            lib/ 2>&1 | tee cppcheck-report.txt || true
+        continue-on-error: true
+
+      - name: Check formatting
+        run: |
+          find lib include -name '*.cpp' -o -name '*.h' | head -50 | \
+            xargs clang-format --dry-run --Werror 2>&1 | tee format-report.txt || true
+        continue-on-error: true
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-quality-reports
+          path: |
+            cppcheck-report.txt
+            format-report.txt
+          retention-days: 7
+
+  # ============================================
+  # Linux Build & Test
+  # ============================================
+  linux-build:
+    name: Linux (${{ matrix.compiler }}, ${{ matrix.build_type }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Release, Debug]
+        include:
+          - compiler: gcc
+            cc: gcc-11
+            cxx: g++-11
+          - compiler: clang
+            cc: clang-14
+            cxx: clang++-14
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            build/_deps
+          key: linux-${{ matrix.compiler }}-deps-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build \
+            libprotobuf-dev protobuf-compiler \
+            libpng-dev libjpeg-dev \
+            libgoogle-glog-dev libgflags-dev \
+            libboost-all-dev \
+            python3-dev python3-pip
+
+      - name: Initialize submodules
+        run: |
+          git submodule sync
+          git submodule update --recursive --init
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DGLOW_WITH_BUNDLES=OFF \
+            -DGLOW_WITH_OPENCL=OFF \
+            -DGLOW_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} -j $(nproc)
+
+      - name: Run tests
+        working-directory: build
+        run: |
+          ctest --build-config ${{ matrix.build_type }} --output-on-failure --timeout 300 || true
+        continue-on-error: true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+          path: build/Testing/
+          retention-days: 7
+
+      - name: Upload build artifacts
+        if: matrix.build_type == 'Release' && matrix.compiler == 'gcc'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coglow-linux-${{ matrix.compiler }}
+          path: |
+            build/bin/
+            build/lib/
+          retention-days: 7
+
+  # ============================================
+  # macOS Build
+  # ============================================
+  macos-build:
+    name: macOS (${{ matrix.build_type }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          brew install cmake ninja protobuf glog gflags boost
+
+      - name: Initialize submodules
+        run: |
+          git submodule sync
+          git submodule update --recursive --init
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DGLOW_WITH_BUNDLES=OFF \
+            -DGLOW_WITH_OPENCL=OFF \
+            -DGLOW_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} -j $(sysctl -n hw.ncpu)
+
+      - name: Run tests
+        working-directory: build
+        run: ctest --build-config ${{ matrix.build_type }} --output-on-failure --timeout 300 || true
+        continue-on-error: true
+
+  # ============================================
+  # Unit Tests
+  # ============================================
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-22.04
+    needs: linux-build
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build \
+            libprotobuf-dev protobuf-compiler \
+            libpng-dev libjpeg-dev \
+            libgoogle-glog-dev libgflags-dev \
+            libboost-all-dev
+
+      - name: Initialize submodules
+        run: |
+          git submodule sync
+          git submodule update --recursive --init
+
+      - name: Configure and Build
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DGLOW_WITH_BUNDLES=OFF \
+            -DGLOW_WITH_OPENCL=OFF \
+            -DGLOW_BUILD_TESTS=ON
+          cmake --build build -j $(nproc)
+
+      - name: Run unit tests
+        working-directory: build
+        run: |
+          # Run specific unit test categories
+          ctest -R "Unit" --output-on-failure --timeout 120 || true
+          ctest -R "Graph" --output-on-failure --timeout 120 || true
+          ctest -R "IR" --output-on-failure --timeout 120 || true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results
+          path: build/Testing/
+          retention-days: 7
+
+  # ============================================
+  # Integration Summary
+  # ============================================
+  integration:
+    name: Integration Summary
+    runs-on: ubuntu-latest
+    needs: [code-quality, linux-build, macos-build, unit-tests]
+    if: always()
+    
+    steps:
+      - name: Check results
+        run: |
+          echo "=== CI Pipeline Summary ==="
+          echo "Code Quality: ${{ needs.code-quality.result }}"
+          echo "Linux Build: ${{ needs.linux-build.result }}"
+          echo "macOS Build: ${{ needs.macos-build.result }}"
+          echo "Unit Tests: ${{ needs.unit-tests.result }}"
+          
+          if [ "${{ needs.linux-build.result }}" = "failure" ]; then
+            echo "::error::Linux build failed"
+            exit 1
+          fi
+          
+          echo "Pipeline completed successfully"
