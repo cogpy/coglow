@@ -18,6 +18,7 @@
 #include <sstream>
 #include <cassert>
 #include <numeric>
+#include <queue>
 
 namespace cog { namespace glow {
 
