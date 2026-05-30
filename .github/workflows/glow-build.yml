@@ -1,5 +1,9 @@
 name: build glow
 
+env:
+  # KSM-13: Prevent LFS failures from blocking CI/CD
+  GIT_LFS_SKIP_SMUDGE: "1"
+
 on:
   pull_request:
   push:
